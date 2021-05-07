@@ -12,35 +12,69 @@ def fuse2(mod):
     return relay.transform.FuseOps(fuse_opt_level=2)(mod)
 
 
-class MarkFnType(ExprVisitor):
+class MarkFnType(ExprMutator):
+    FN_DENSE = "Dense"
+    FN_CONCAT = "Concat"
+    FN_SPLIT = "Split"
+    FN_REMAP = "Remap"
+    FN_ELEMWISE = "Elemwise"
+
     def __init__(self):
+        self.fn_types = set()
         super().__init__()
-        self.dense_fns = []
-        self.shuffle_fns = []
-        self.dense_ops = []
 
-    # def visit(self, expr):
-    #     ret = super().visit(expr)
-    #     # self.memo_map = {}
-    #     return ret
-
-    def visit_op(self, op):
+    def visit_call(self, call):
+        op = call.op
         # import pdb; pdb.set_trace()
-        print("got op:", op.name, id(op))
-        if op.name in ["nn.dense", "nn.conv2d", "nn.batch_matmul"]:
-            self.dense_ops.append(op)
+        if isinstance(op, tvm.ir.op.Op):
+            print("got call op:", op.name)
+            if op.name in ["nn.dense", "nn.conv2d", "nn.batch_matmul"]:
+                self.fn_types.add(self.FN_DENSE)
+            elif op.name in ["reshape", "squeeze"]:
+                self.fn_types.add(self.FN_REMAP)
+            elif op.name in ["concatenate", "pad"]:
+                self.fn_types.add(self.FN_CONCAT)
+            elif op.name in ["split", "gather_nd"]:
+                self.fn_types.add(self.FN_SPLIT)
+            elif op.name in ["nn.relu", "add"]:
+                self.fn_types.add(self.FN_ELEMWISE)
+        return super().visit_call(call)
 
     def visit_function(self, fn):
         if int(getattr(fn.attrs, "Primitive", 0)) == 0:
-            self.visit(fn.body)
-            return fn
+            return super().visit_function(fn)
         # import pdb; pdb.set_trace()
-        self.dense_ops = []
+        self.fn_types = set()
         self.visit(fn.body)
-        if self.dense_ops:
-            self.dense_fns.append(fn)
+        if self.fn_types:
+            attrs = dict(fn.attrs)
+            if self.FN_DENSE in self.fn_types:
+                attrs["FnType"] = self.FN_DENSE
+            elif self.FN_CONCAT in self.fn_types:
+                attrs["FnType"] = self.FN_CONCAT
+            elif self.FN_SPLIT in self.fn_types:
+                attrs["FnType"] = self.FN_SPLIT
+            elif self.FN_REMAP in self.fn_types:
+                attrs["FnType"] = self.FN_REMAP
+            elif self.FN_ELEMWISE in self.fn_types:
+                attrs["FnType"] = self.FN_ELEMWISE
+            else:
+                attrs["FnType"] = "?"
+            attrs = tvm.ir.make_node("DictAttrs", **attrs)
         else:
-            self.shuffle_fns.append(fn)
+            attrs = fn.attrs
+        return Function(fn.params, fn.body, fn.ret_type, fn.type_params, attrs)
+
+
+class FuseTensorView(ExprMutator):
+    def __init__(self):
+        self.fusing_counter = 0
+        super().__init__()
+
+    def visit_call(self, call):
+        new_fn = self.visit(call.op)
+        new_args = [self.visit(arg) for arg in call.args]
+        return expr.Call(new_fn, new_args, call.attrs, call.type_args, call.span)
 
 
 @transform.function_pass(opt_level=0)
@@ -49,31 +83,33 @@ class TensorViewPass:
 
     def transform_function(self, func, mod, _):
         pass0 = MarkFnType()
-        pass0.visit(func)
-        for k, i in enumerate(pass0.dense_fns):
-            print("=====dense: %d=====" % k)
-            print(i)
-        for k, i in enumerate(pass0.shuffle_fns):
-            print("=====shuffle: %d=====" % k)
-            print(i)
-        print("=====end======")
-        return func
+        pass1 = FuseTensorView()
+        m = pass0.visit(func)
+        print("====MarkFnType====")
+        print(m)
+        print("====FuseTensorView====")
+        m = pass1.visit(m)
+        return m
 
 
 def test_easy_case():
     """Test fusion case involving concat and gather_nd"""
 
     def before():
-        shape = (tvm.tir.const(10, "int64"), tvm.tir.const(1, "int64"))
-        x = relay.var("x", shape=shape, dtype="int64")
+        x = relay.var("x", shape=(10, 1), dtype="int64")
+        w1 = relay.var("w1", shape=(1, 2, 1), dtype="int64")
+        w2 = relay.var("w2", shape=(2, 1), dtype="int64")
         x1 = relay.gather_nd(x, indices=relay.expr.const([[0, 1], [1, 0]], dtype="int64"))
-        x2 = relay.nn.dense(x, relay.expr.const([[3], [4]], dtype="int64"))
+        x = relay.reshape(x, [1, 10, 1])
+        y2 = relay.nn.batch_matmul(x, w1)
+        # y2 = relay.reshape(y2, [10, 2])
+        y2 = relay.squeeze(y2)
         x1 = relay.nn.relu(x1)
         x1 = relay.reshape(x1, [-1, 1])
-        x1 = relay.nn.dense(x1, relay.expr.const([[5], [6]], dtype="int64"))
-        concat = relay.concatenate([x1, x2], axis=0)
+        y1 = relay.nn.dense(x1, w2)
+        concat = relay.concatenate([y1, y2], axis=0)
         y = relay.add(concat, relay.expr.const(3, dtype="int64"))
-        out = relay.Tuple([x2, y])
+        out = relay.Tuple([y, y2])
         return relay.Function(relay.analysis.free_vars(out), out)
 
     def expected():
@@ -99,6 +135,7 @@ def test_easy_case():
 
     pass0 = TensorViewPass()
     m = pass0(m)
+    print("---final---")
     print(m)
     # opt = run_opt_pass(m, pass0)
 
@@ -195,7 +232,12 @@ def test_transformer_case():
     # assert tvm.ir.structural_equal(m["main"], after)
     # print(after)
 
+    pass0 = TensorViewPass()
+    m = pass0(m)
+    print("---final---")
+    print(m)
+
 
 if __name__ == "__main__":
     test_easy_case()
-    # test_transformer_case()
+    test_transformer_case()

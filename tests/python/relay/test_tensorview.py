@@ -5,6 +5,7 @@ from tvm.relay.testing import run_opt_pass
 from tvm.relay import transform, expr
 from tvm.relay.expr_functor import ExprVisitor, ExprMutator
 from tvm.relay.function import Function
+from tvm.relay.expr import Let, Call
 
 
 def fuse2(mod):
@@ -69,17 +70,33 @@ class MarkFnType(ExprMutator):
 class FuseTensorView(ExprMutator):
     def __init__(self):
         self.fusing_counter = 0
+        self.fn_inputs = {}
         super().__init__()
 
     def visit_call(self, call):
+        if isinstance(call.op, Function):
+            if call.op not in self.fn_inputs:
+                self.fn_inputs[call.op] = []
+            for arg in call.args:
+                if isinstance(arg, expr.Var):
+                    import pdb; pdb.set_trace()
+                elif isinstance(arg.op, Function):
+                    self.fn_inputs[call.op].append(arg.op)
+                else:
+                    import pdb; pdb.set_trace()
+
         new_fn = self.visit(call.op)
         new_args = [self.visit(arg) for arg in call.args]
         return expr.Call(new_fn, new_args, call.attrs, call.type_args, call.span)
 
+    def visit_function(self, fn):
+        new_params = [self.visit(x) for x in fn.params]
+        new_body = self.visit(fn.body)
+        return Function(list(new_params), new_body, fn.ret_type, fn.type_params, fn.attrs)
+
 
 @transform.function_pass(opt_level=0)
 class TensorViewPass:
-    """An explicit pass wrapper around LiftConst."""
 
     def transform_function(self, func, mod, _):
         pass0 = MarkFnType()
@@ -89,6 +106,8 @@ class TensorViewPass:
         print(m)
         print("====FuseTensorView====")
         m = pass1.visit(m)
+
+        import pdb; pdb.set_trace()
         return m
 
 
@@ -240,4 +259,4 @@ def test_transformer_case():
 
 if __name__ == "__main__":
     test_easy_case()
-    test_transformer_case()
+    # test_transformer_case()

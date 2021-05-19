@@ -2,7 +2,7 @@ import math
 import tvm
 from tvm import relay
 from tvm.relay.testing import run_opt_pass
-from tvm.relay import transform, expr
+from tvm.relay import transform, expr, annotation
 from tvm.relay.expr_functor import ExprVisitor, ExprMutator
 from tvm.relay.function import Function
 from tvm.relay.expr import Let, Call
@@ -67,47 +67,103 @@ class MarkFnType(ExprMutator):
         return Function(fn.params, fn.body, fn.ret_type, fn.type_params, attrs)
 
 
-class FuseTensorView(ExprMutator):
+class AnalyseDependency(ExprVisitor):
     def __init__(self):
-        self.fusing_counter = 0
-        self.fn_inputs = {}
+        self.node_inputs = {}
         super().__init__()
 
     def visit_call(self, call):
         if isinstance(call.op, Function):
-            if call.op not in self.fn_inputs:
-                self.fn_inputs[call.op] = []
+            if call not in self.node_inputs:
+                self.node_inputs[call] = []
             for arg in call.args:
-                if isinstance(arg, expr.Var):
-                    import pdb; pdb.set_trace()
+                if isinstance(arg, (expr.Var, expr.Constant)):
+                    self.node_inputs[call].append(arg)
                 elif isinstance(arg.op, Function):
-                    self.fn_inputs[call.op].append(arg.op)
+                    self.node_inputs[call].append(arg)
                 else:
                     import pdb; pdb.set_trace()
+        else:
+            print("this call is not Function")
 
+        super().visit_call(call)
+
+
+class MarkFusion(ExprMutator):
+    def __init__(self, node_outputs):
+        self.node_outputs = node_outputs
+        self.got_dense = 0
+        super().__init__()
+
+    def visit_call(self, call):
         new_fn = self.visit(call.op)
-        new_args = [self.visit(arg) for arg in call.args]
+
+        if isinstance(call.op, Function):
+            new_args = []
+            for arg in call.args:
+                self.got_dense = 0
+                new_arg = self.visit(arg)
+                need_stop_fusion = False
+                # 1: stop fusion by multiple outputs
+                if len(self.node_outputs[arg]) > 1:
+                    need_stop_fusion = True
+                # 2: stop fusion by sequential DenseFn
+                if self.got_dense > 0:
+                    # todo: seems buggy here
+                    import pdb; pdb.set_trace()
+                    need_stop_fusion = True
+                
+                if need_stop_fusion:
+                    new_arg = annotation.stop_fusion(new_arg)
+                    # self.got_dense = 0
+                new_args.append(new_arg)
+        else:
+            new_args = [self.visit(arg) for arg in call.args]
+
         return expr.Call(new_fn, new_args, call.attrs, call.type_args, call.span)
 
     def visit_function(self, fn):
-        new_params = [self.visit(x) for x in fn.params]
-        new_body = self.visit(fn.body)
-        return Function(list(new_params), new_body, fn.ret_type, fn.type_params, fn.attrs)
+        if fn.attrs:
+            attrs = dict(fn.attrs)
+            if "FnType" in attrs and attrs["FnType"] == "Dense":
+                import pdb; pdb.set_trace()
+                self.got_dense += 1
+        return super().visit_function(fn)
 
 
 @transform.function_pass(opt_level=0)
 class TensorViewPass:
+    OUTPUT_NODE = "OUTPUT_NODE"
 
     def transform_function(self, func, mod, _):
         pass0 = MarkFnType()
-        pass1 = FuseTensorView()
+        pass1 = AnalyseDependency()
         m = pass0.visit(func)
         print("====MarkFnType====")
         print(m)
-        print("====FuseTensorView====")
-        m = pass1.visit(m)
+        print("====AnalyseDependency====")
+        
+        # add output_nodes
+        if isinstance(m.body, expr.Call):
+            pass1.node_inputs[self.OUTPUT_NODE] = [m.body]
+        else:
+            pass1.node_inputs[self.OUTPUT_NODE] = list(m.body)
+        pass1.visit(m)
 
-        import pdb; pdb.set_trace()
+        node_outputs = {}
+        for k, v in pass1.node_inputs.items():
+            for i in v:
+                if i not in node_outputs:
+                    node_outputs[i] = set()
+                node_outputs[i].add(k)
+        
+        for k, v in node_outputs.items():
+            print('----')
+            print(k)
+            print("outputs:%d" % len(v))
+
+        pass2 = MarkFusion(node_outputs)
+        m = pass2.visit(m)
         return m
 
 
@@ -259,4 +315,4 @@ def test_transformer_case():
 
 if __name__ == "__main__":
     test_easy_case()
-    # test_transformer_case()
+    test_transformer_case()
